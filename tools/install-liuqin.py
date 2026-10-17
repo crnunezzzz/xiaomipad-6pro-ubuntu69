@@ -323,6 +323,36 @@ def check_android_boot(parser, path):
     return sha(path)
 
 
+def check_bootloader_state(parser, mode, getvar):
+    """Bootloader state that must hold before the RAM installer is booted.
+
+    Slot A must be the active slot.  The installer ends with
+    `fastboot --set-active`, and on a tablet that an Android OTA has moved to
+    slot B, slot A still carries the previous release's xbl, abl and TrustZone:
+    activating it would pair them with the newer firmware the installer
+    writes, or start a bootloader older than the anti-rollback fuse.
+    The dual layout also writes stock images of the pinned ROM, so a tablet
+    whose anti-rollback index is above that ROM's is refused.  A bootloader
+    that does not report the index is admitted with a warning.
+    """
+    slot = getvar('current-slot')
+    if slot is None or slot.removeprefix('_') != 'a':
+        parser.error('the active slot is ' + (slot or 'unknown') + ', not a; switch to slot A with the'
+                     ' stock ROM (not with --set-active) before installing'
+                     ' —— 当前激活槽位不是 A，请先用原厂 ROM 回到 A 槽再安装')
+    if mode != 'dual':
+        return
+    pinned = load_rom_table(parser)['anti_version']
+    anti = getvar('anti')
+    if anti is None:
+        print('warning: the bootloader does not report its anti-rollback index; make sure the'
+              f' pinned ROM (anti {pinned}) is not older than the installed one', file=sys.stderr)
+    elif not anti.isdigit() or int(anti) > pinned:
+        parser.error(f'the tablet reports anti-rollback index {anti}, above the {pinned} of the'
+                     ' pinned ROM; its images cannot be written to this tablet'
+                     ' —— 设备防回滚版本高于本项目验证的 ROM，拒绝写入')
+
+
 def load_rom_table(parser):
     """The pinned stock-ROM identities, from the repository or from the bundle."""
     here = Path(__file__).resolve().parent
@@ -414,6 +444,19 @@ def main(argv=None):
         if not re.search(r'\b' + name + r':\s*' + value + r'\b', fastboot('getvar', name)):
             parser.error('Fastboot device check failed: ' + name +
                          ' —— 请确认设备是小米平板 6 Pro（liuqin）且已解锁 Bootloader')
+
+    def optional_getvar(name):
+        """A getvar the bootloader may not implement: None instead of an error."""
+        try:
+            output = fastboot('getvar', name)
+        except subprocess.CalledProcessError:
+            return None
+        match = re.search(r'^(?:\(bootloader\)\s*)?' + re.escape(name) + r':[ \t]*(\S+)',
+                          output, re.MULTILINE)
+        return match[1] if match else None
+
+    if restore is None:
+        check_bootloader_state(parser, args.layout, optional_getvar)
 
     def partition_size(name, required=True):
         match = re.search(r'partition-size:' + re.escape(name) + r':\s*(0x[0-9a-fA-F]+)',
@@ -520,6 +563,10 @@ def main(argv=None):
         if release != manifest['kernel_release']:
             raise RuntimeError('Installer kernel does not match this bundle'
                                ' —— 安装器内核与包不匹配，请使用同一发布包内的全部文件')
+        # install-root.sh checks the charge again, but only after the
+        # partition table has been rewritten; a low battery must stop the
+        # installation while nothing on the tablet has changed.
+        check_battery(remote(BATTERY_PROBE).decode())
         if restore is not None:
             restore_partition_table(remote, device_layout, restore, args.serial)
             remote("(sleep 2; /usr/sbin/liuqin-reboot bootloader) >/dev/null 2>&1 &")
@@ -616,6 +663,23 @@ def main(argv=None):
             server.server_close()
         if scratch:
             scratch.cleanup()
+
+
+# The same minimum and the same power-supply walk as install-root.sh.
+MIN_BATTERY_PERCENT = 30
+BATTERY_PROBE = ('for s in /sys/class/power_supply/*; do'
+                 ' [ "$(cat "$s/type" 2>/dev/null)" = Battery ] || continue;'
+                 ' cat "$s/capacity"; break; done')
+
+
+def check_battery(report):
+    level = report.strip()
+    if not level.isdigit():
+        raise RuntimeError('battery level is unavailable; nothing was written')
+    if int(level) < MIN_BATTERY_PERCENT:
+        raise RuntimeError(f'battery is at {level}%; charge the tablet to at least'
+                           f' {MIN_BATTERY_PERCENT}% before installation. Nothing was written'
+                           ' —— 电量不足，未写入任何内容')
 
 
 def boot_slots(mode):
@@ -797,7 +861,8 @@ def restore_partition_table(remote, device_layout, directory, serial):
 
 
 def apply_layout(device_layout, before, plan, saved, mode):
-    """Wipe stale metadata, write the table once, verify it, restore on failure."""
+    """Wipe stale metadata, write the table once, verify it; on failure, name
+    the saved copy for --restore-partition-table."""
     userdata = before.by_name(layout.USERDATA_NAME)
     info = layout.parse_info(device_layout('info', layout.USERDATA_NAME))
     if info['first_sector'] != userdata.first_sector or info['name'] != layout.USERDATA_NAME:
@@ -821,7 +886,10 @@ def apply_layout(device_layout, before, plan, saved, mode):
         if plan.entry(layout.USERDATA_NAME).action != 'delete':
             layout.verify_preserved(info, layout.parse_info(device_layout('info', layout.USERDATA_NAME)))
     except (RuntimeError, layout.LayoutError) as error:
-        print('Partition-table edit failed; restoring the saved table.', file=sys.stderr, flush=True)
+        # Nothing is restored automatically: the operator decides, from the
+        # saved copy, once the failure is understood.
+        print('Partition-table edit failed; the saved table was NOT written back.',
+              file=sys.stderr, flush=True)
         raise RuntimeError(str(error) + ' —— 分区表写入失败，请用 --restore-partition-table '
                            + str(saved.parent) + ' 恢复出厂分区表后重试')
     print('New partition table verified.')

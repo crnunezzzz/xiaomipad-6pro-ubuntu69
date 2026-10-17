@@ -138,6 +138,12 @@ it active.
   logical sectors and `userdata` as the last partition. Modified partition
   layouts are rejected.
 - Unlocked bootloader and the device in Fastboot mode.
+- Slot A active (`fastboot getvar current-slot` reports `a`). An Android OTA can leave
+  the tablet on slot B, whose counterpart in slot A holds the previous release's
+  bootloader chain; the installer refuses to start until slot A is active again,
+  restored through the stock ROM rather than `fastboot --set-active`. For
+  `--layout dual` it also refuses a tablet whose reported anti-rollback index
+  (`fastboot getvar anti`) is above that of the pinned ROM.
 - Battery at least 30 percent charged.
 - Linux host with Python 3.11 or newer, Android platform-tools and USB networking.
 - Personal files backed up outside the tablet. Installation erases all userdata.

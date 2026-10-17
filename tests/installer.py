@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory() as directory:
                                    )['images']['boot.img']['bytes']
 
     def run_install(argv_extra, reported, stdin_tty=False, answer=None, boot_size=hex(pinned_boot_bytes),
-                    max_download='0x30000000'):
+                    max_download='0x30000000', slot='a', anti=None):
         calls = []
 
         def fastboot(command, **kwargs):
@@ -72,9 +72,12 @@ with tempfile.TemporaryDirectory() as directory:
             if command[3] == 'boot':
                 return SimpleNamespace(stdout='booting\n')
             name = command[-1]
-            values = {'product': 'liuqin', 'unlocked': 'yes', 'current-slot': 'a',
+            values = {'product': 'liuqin', 'unlocked': 'yes', 'current-slot': slot, 'anti': anti,
                       'partition-size:userdata': reported, 'partition-size:boot_a': boot_size,
                       'partition-size:boot_b': boot_size, 'max-download-size': max_download}
+            if values[name] is None:
+                # What fastboot does for a variable this bootloader lacks.
+                raise subprocess.CalledProcessError(1, command, 'getvar:' + name + ' FAILED')
             return SimpleNamespace(stdout=name + ': ' + values[name] + '\n')
 
         stdin = SimpleNamespace(isatty=lambda: stdin_tty)
@@ -134,6 +137,39 @@ with tempfile.TemporaryDirectory() as directory:
     calls = run_install(['--yes'], hex(16 * 1024**3), max_download=str(pinned_boot_bytes))
     assert calls[-1][3] == 'boot', calls
     print('PASS: boot partitions must be the pinned size and fit one fastboot download')
+
+    # A tablet left on slot B by an OTA still carries the previous release's
+    # bootloader chain in slot A; nothing is booted until slot A is active.
+    for slot in ('b', '_b', None):
+        calls = run_install(['--yes'], hex(16 * 1024**3), slot=slot)
+        assert not any(call[3:4] == ['boot'] for call in calls), (slot, calls)
+    calls = run_install(['--yes'], hex(16 * 1024**3), slot='_a')
+    assert calls[-1][3] == 'boot', calls
+    print('PASS: the RAM installer is booted only when slot A is the active slot')
+
+    pinned_anti = json.loads((project / 'tools/lib/liuqin-rom-images.json').read_text())['anti_version']
+    for anti, admitted in ((None, True), (str(pinned_anti), True), (str(pinned_anti + 1), False),
+                           ('garbage', False)):
+        messages = []
+        parser = SimpleNamespace(error=lambda text: (messages.append(text), (_ for _ in ()).throw(SystemExit(2))))
+        getvar = {'current-slot': 'a', 'anti': anti}.get
+        try:
+            installer.check_bootloader_state(parser, 'dual', getvar)
+        except SystemExit:
+            pass
+        assert (not messages) == admitted, (anti, messages)
+    installer.check_bootloader_state(SimpleNamespace(error=None), 'linux-only',
+                                     {'current-slot': 'a', 'anti': '99'}.get)
+    print('PASS: the dual layout refuses a tablet whose anti-rollback index is above the pinned ROM')
+
+    for report, admitted in (('30\n', True), ('100', True), ('29\n', False), ('', False), ('n/a', False)):
+        try:
+            installer.check_battery(report)
+        except RuntimeError:
+            assert not admitted, report
+        else:
+            assert admitted, report
+    print('PASS: the battery gate runs on the RAM report before anything is written')
 
 # A local fake shell supplies a CRLF transcript containing the echoed command.
 # Only complete marker lines may finish the transaction, not the echo itself.
