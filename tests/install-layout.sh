@@ -76,6 +76,11 @@ if [ "$bb_command" = blockdev ]; then
 	esac
 	exit 0
 fi
+# A test cannot mount; the persist tree is laid out at the mount point.
+case $bb_command in
+mount) [ -z "${TEST_FAIL_MOUNT:-}" ] || exit 1; exit 0 ;;
+umount) exit 0 ;;
+esac
 if [ -n "${TEST_BUSYBOX:-}" ]; then
 	exec "$TEST_BUSYBOX" "$bb_command" "$@"
 fi
@@ -187,10 +192,12 @@ build_script() {
 		s|LIUQIN_LAYOUT_WORK:-/run/liuqin-layout|LIUQIN_LAYOUT_WORK:-$work|
 		s|^BB=/bin/busybox\$|BB=$bin/bb|
 		s|^SGDISK=/usr/sbin/sgdisk\$|SGDISK=$bin/sgdisk|
+		s|^POWER_SUPPLY=/sys/class/power_supply\$|POWER_SUPPLY=$case_root/power|
+		s|^MEMINFO=/proc/meminfo\$|MEMINFO=$case_root/meminfo|
 		s|/dev/\${|$dev/\${|g
 		s|\[ -b |[ -e |g
 	" "$layout_source" >"$script"
-	for stale in '/sys/class/block' '/proc/self/mountinfo' '/bin/busybox' \
+	for stale in '/sys/class/block' '/proc/self/mountinfo' '/bin/busybox' '/sys/class/power_supply' '/proc/meminfo' \
 		'/usr/sbin/sgdisk' '[ -b ' '/run/liuqin-layout'; do
 		! grep -qF "$stale" "$script" ||
 			fail "the fixture rewrite missed $stale; the script's paths changed"
@@ -225,6 +232,7 @@ run_env() {
 		TEST_COMMAND_LOG="$command_log" \
 		TEST_FAIL_SETRW="${TEST_FAIL_SETRW:-none}" \
 		TEST_SGDISK_STATUS="${TEST_SGDISK_STATUS:-0}" \
+		TEST_FAIL_MOUNT="${TEST_FAIL_MOUNT:-}" \
 		"$shell" $shell_argument "$@"
 }
 
@@ -565,5 +573,73 @@ reset_fixture
 status=0
 output=$(run_env "$script" "$(cat "$case_root/boot_id")" 2>&1) || status=$?
 expect_die usage 'usage: install-layout.sh'
+
+# --------------------------------------------------------------------------
+# preflight: what install-root.sh would refuse, checked before any write.
+# --------------------------------------------------------------------------
+preflight_fixture() { # BATTERY_LEVEL MEMAVAILABLE_KIB
+	reset_fixture
+	add_part persist 21 8:21 16384
+	mkdir -p "$case_root/power/battery" "$case_root/power/usb"
+	printf 'USB\n' >"$case_root/power/usb/type"
+	printf 'Battery\n' >"$case_root/power/battery/type"
+	printf '%s\n' "$1" >"$case_root/power/battery/capacity"
+	printf 'MemTotal:       11000000 kB\nMemAvailable:   %s kB\n' "$2" >"$case_root/meminfo"
+	mkdir -p "$work/persist/wlan" "$work/persist/bluetooth" "$work/persist/audio" \
+		"$work/persist/sensors/registry/registry"
+	: >"$work/persist/wlan/wlan_mac.bin"
+	: >"$work/persist/bluetooth/.bt_nv.bin"
+	: >"$work/persist/audio/crus_calr.bin"
+}
+preflight_unmounted() { # NAME
+	grep -q "^bb umount $work/persist\$" "$command_log" || fail "$1: persist was not unmounted"
+	if grep -q 'blockdev --setrw' "$command_log"; then fail "$1: preflight opened a node for writing"; fi
+}
+
+preflight_fixture 80 8000000
+run_verb preflight 1073741824
+expect_ok preflight-ok
+expect_output preflight-ok 'liuqin-layout: PREFLIGHT_OK battery=80'
+grep -q "^bb mount -t ext4 -o ro,noload $dev/sda21 $work/persist\$" "$command_log" ||
+	fail 'preflight-ok: persist was not mounted read-only without journal replay'
+preflight_unmounted preflight-ok
+
+preflight_fixture 29 8000000
+run_verb preflight 0
+expect_die preflight-battery 'battery is at 29%'
+
+preflight_fixture 30 8000000
+run_verb preflight 0
+expect_ok preflight-battery-threshold
+
+preflight_fixture 80 8000000
+rm -rf "$case_root/power/battery"
+run_verb preflight 0
+expect_die preflight-no-battery 'battery level is unavailable'
+
+preflight_fixture 80 1000000
+run_verb preflight 1073741824
+expect_die preflight-ram 'insufficient RAM to stage the root archive'
+
+preflight_fixture 80 1000000
+run_verb preflight 0
+expect_ok preflight-no-archive
+
+preflight_fixture 80 8000000
+rm -f "$work/persist/audio/crus_calr.bin"
+rm -rf "$work/persist/sensors"
+run_verb preflight 0
+expect_die preflight-factory 'factory data is incomplete in persist: audio/crus_calr.bin sensors/registry/registry/'
+preflight_unmounted preflight-factory
+
+preflight_fixture 80 8000000
+TEST_FAIL_MOUNT=1
+run_verb preflight 0
+TEST_FAIL_MOUNT=
+expect_die preflight-mount 'cannot mount persist read-only'
+
+preflight_fixture 80 8000000
+run_verb preflight 12x
+expect_die preflight-size 'invalid archive size'
 
 printf '%s\n' 'liuqin install-layout execution tests: PASS'

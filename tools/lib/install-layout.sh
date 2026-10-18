@@ -125,7 +125,54 @@ block_digest() {
 	printf '%s' "$digest"
 }
 
+# What preflight reads.  The same minimum, power-supply walk, RAM headroom and
+# factory-data list install-root.sh applies, which only runs after the table
+# has been rewritten.
+POWER_SUPPLY=/sys/class/power_supply
+MEMINFO=/proc/meminfo
+MIN_BATTERY=30
+FACTORY_FILES='wlan/wlan_mac.bin bluetooth/.bt_nv.bin audio/crus_calr.bin'
+FACTORY_DIRS='sensors/registry/registry'
+
 case $verb in
+preflight)
+	# Everything install-root.sh will refuse for reasons that have nothing to
+	# do with the new layout, checked while nothing on the tablet has changed:
+	# battery charge, room to stage an archive of BYTES (0: no archive), and
+	# this tablet's factory data in persist, mounted read-only without
+	# journal replay and unmounted again whatever the result.
+	[ "$#" = 1 ] || die 'usage: preflight ARCHIVE_BYTES'
+	case $1 in ''|*[!0-9]*) die 'invalid archive size' ;; esac
+	level=
+	for supply in "$POWER_SUPPLY"/*; do
+		[ "$(cat "$supply/type" 2>/dev/null || true)" = Battery ] || continue
+		level=$(cat "$supply/capacity" 2>/dev/null || true)
+		break
+	done
+	case $level in ''|*[!0-9]*) die 'battery level is unavailable' ;; esac
+	[ "$level" -ge "$MIN_BATTERY" ] ||
+		die "battery is at $level%; charge the tablet to at least $MIN_BATTERY% before installation"
+	if [ "$1" -gt 0 ]; then
+		available=$(awk '/^MemAvailable:/ {print $2}' "$MEMINFO")
+		case $available in ''|*[!0-9]*) die 'available memory is unknown' ;; esac
+		[ "$(( $1 + 536870912 ))" -lt "$(( available * 1024 ))" ] ||
+			die 'insufficient RAM to stage the root archive'
+	fi
+	part=$(find_part persist)
+	mnt=$WORK/persist
+	mkdir -p "$mnt" || die 'cannot create the persist mount point'
+	"$BB" mount -t ext4 -o ro,noload "$part" "$mnt" || die 'cannot mount persist read-only'
+	missing=
+	for item in $FACTORY_FILES; do
+		[ -f "$mnt/$item" ] || missing="$missing $item"
+	done
+	for item in $FACTORY_DIRS; do
+		[ -d "$mnt/$item" ] || missing="$missing $item/"
+	done
+	"$BB" umount "$mnt" || die 'cannot unmount persist'
+	[ -z "$missing" ] || die "factory data is incomplete in persist:$missing"
+	printf 'liuqin-layout: PREFLIGHT_OK battery=%s\n' "$level"
+	;;
 disk)
 	[ "$#" = 1 ] || die 'usage: disk PARTNAME'
 	part=$(find_part "$1")

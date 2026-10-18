@@ -26,11 +26,31 @@ nadie ha probado en hardware**.
 | S1 | No se comprobaba que el slot A estuviera activo, aunque la documentación lo exige | Alta | **Corregido** en esta rama |
 | S2 | `anti_version` de la ROM estaba fijado pero nunca se comparaba con el dispositivo | Alta | **Corregido** (cuando el ABL informa `anti`) |
 | S3 | El modo dual instala imágenes de **una única ROM china exacta** (OS2.0.6.0.VMYCNXM) junto a una cadena de arranque que puede ser más nueva | Alta | Pendiente: requiere un procedimiento y hardware |
-| D1 | Sin KernelSU no hay vuelta a Ubuntu desde Android ni bloqueo de OTA; HyperOS CN puede actualizarse sola y destruir la copia de respaldo en `boot_b` | Alta | Pendiente: documentación y validación |
+| D1 | Sin KernelSU no hay vuelta a Ubuntu desde Android ni bloqueo de OTA; HyperOS CN puede actualizarse sola y destruir la copia de respaldo en `boot_b` | Alta | El instalador ahora **avisa**; guía en `RECUPERACION.es.md`; falta validación en hardware |
 | U1 | No existe una vía para actualizar el kernel sin reinstalar. Reinstalar con `--keep-home` borra las cuentas y las huellas | Alta (mantenimiento) | Propuesta de diseño |
-| S4 | Las comprobaciones de batería, RAM y `persist` se hacían **después** de reparticionar | Media | La batería está **corregida**; RAM y `persist` siguen pendientes |
+| S4 | Las comprobaciones de batería, RAM y `persist` se hacían **después** de reparticionar | Media | **Corregido** (verbo `preflight`) |
 | K1 | El kernel se basa en 6.17, que no es LTS y ya no recibe parches de seguridad | Media-Alta | Recomendación: rebase a 6.18 LTS |
 | K2 | Los argumentos de arranque de producción son de depuración (`clk_ignore_unused`, `pd_ignore_unused`, `initcall_debug`, `panic=0`) | Media | Recomendación |
+
+### Corregido en esta rama
+
+- **S1, S2:** el instalador se niega a continuar si el slot activo no es A o si
+  el anti-rollback de la tablet es mayor que el de la ROM fijada.
+- **S4:** un verbo `preflight` del script del dispositivo comprueba la batería,
+  la RAM y los datos de fábrica de `persist` antes de cualquier copia o
+  escritura.
+- **S5:** el mensaje de error ya no dice que restaura la tabla.
+- **S6:** cada partición que recibe una imagen de la ROM (excepto `super`) se
+  respalda y verifica antes de sobrescribirla.
+- **D1:** aviso explícito si el modo dual se instala sin imagen KernelSU.
+- **D3:** `liuqin-switch import-ubuntu` permite instalar una imagen nueva de
+  Ubuntu sin reinstalar, conservando la anterior en `store/ubuntu.prev`.
+- **Reversión exacta:** si una escritura de `boot_a` falla, se restaura byte a
+  byte lo que había, no la imagen del otro sistema.
+- **S10:** la CI ejecuta las pruebas del conmutador, del almacén y de los slots.
+- **Guía de recuperación:** [`RECUPERACION.es.md`](RECUPERACION.es.md).
+
+Sigue pendiente lo que necesita hardware: S3, D2, D4, K1 y K2.
 
 ## 0. Antes de tocar tu tablet: lista de verificación
 

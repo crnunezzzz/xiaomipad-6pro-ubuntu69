@@ -385,6 +385,62 @@ run_suite() { # <label> <shell>...
 	says 'a v2 image without a DTB is not ours' 'identifies as neither system [unknown]'
 	untouched 'unknown images'
 
+	# --- import-ubuntu: a new build, with the old one kept ------------------
+	make_set "$store/ubuntu" ubuntu one
+	make_set "$store/android" android stored
+	rm -rf "$store/ubuntu.prev"
+	cp "$store/android/boot.img" "$dev/boot_a"
+	head -c $((BOOT_SIZE - $(stat -c %s "$dev/boot_a"))) /dev/zero >>"$dev/boot_a"
+	rm -f "$dev/.ro-log" "$dev/.rebooted"
+	make_android "$work/android-as-ubuntu.img" wrong
+	run import-ubuntu "$work/android-as-ubuntu.img"
+	refused 'import-ubuntu of an Android image'
+	check 'refused import-ubuntu leaves store/ubuntu alone' "$(padded "$store/ubuntu/boot.img")" "$ubuntu_one"
+	run import-ubuntu "$work/other-ubuntu.img" --dry-run
+	succeeded 'import-ubuntu --dry-run'
+	check 'import-ubuntu --dry-run writes nothing' "$(padded "$store/ubuntu/boot.img")" "$ubuntu_one"
+	make_ubuntu "$work/ubuntu-two.img" two
+	ubuntu_two=$(padded "$work/ubuntu-two.img")
+	run import-ubuntu "$work/ubuntu-two.img"
+	succeeded 'import-ubuntu of a new Ubuntu build'
+	check 'import-ubuntu: store/ubuntu holds the new build' "$(padded "$store/ubuntu/boot.img")" "$ubuntu_two"
+	check 'import-ubuntu: the previous build is kept' "$(padded "$store/ubuntu.prev/boot.img")" "$ubuntu_one"
+	run verify
+	succeeded 'verify after import-ubuntu'
+	run status
+	says 'status lists store/ubuntu.prev' 'store/ubuntu.prev'
+	untouched 'import-ubuntu'
+	run to-ubuntu --no-reboot
+	succeeded 'to-ubuntu after import-ubuntu'
+	check 'to-ubuntu writes the imported build' "$(sum "$dev/boot_a")" "$ubuntu_two"
+	rm -f "$dev/.ro-log"
+
+	# --- a failed write puts back exactly what boot_a held ------------------
+	# boot_a holds an Ubuntu build that is in no set; the way back named by
+	# to-android would be store/ubuntu, a different build.  The rollback
+	# restores the bytes that were there instead.
+	make_ubuntu "$work/ubuntu-three.img" three
+	cp "$work/ubuntu-three.img" "$dev/boot_a"
+	head -c $((BOOT_SIZE - $(stat -c %s "$dev/boot_a"))) /dev/zero >>"$dev/boot_a"
+	before_three=$(sum "$dev/boot_a")
+	: >"$dev/.fault-corrupt"
+	run to-android --no-reboot
+	refused 'to-android with a read-back mismatch over an unstored Ubuntu build'
+	says 'exact rollback: says what it restored' 'holds its previous contents again (verified)'
+	check 'exact rollback: boot_a holds the unstored build again' "$(sum "$dev/boot_a")" "$before_three"
+	check 'exact rollback: the copy is removed' "$(ls "$store"/.live-* 2>/dev/null | wc -l | tr -d ' ')" 0
+	rm -f "$dev/.ro-log"
+	sealed 'exact rollback'
+	: >"$dev/.fault-write"
+	run to-ubuntu --no-reboot
+	refused 'to-ubuntu with a failed write over an unstored Ubuntu build'
+	check 'exact rollback after a failed write' "$(sum "$dev/boot_a")" "$before_three"
+	rm -f "$dev/.ro-log"
+	run to-ubuntu --no-reboot
+	succeeded 'to-ubuntu over an unstored Ubuntu build'
+	check 'success removes the copy' "$(ls "$store"/.live-* 2>/dev/null | wc -l | tr -d ' ')" 0
+	rm -f "$dev/.ro-log"
+
 	# --- one switch at a time -------------------------------------------------
 	mkdir -p "$dev/.lock"
 	run status

@@ -34,7 +34,8 @@
 #   * an image that identifies as ours is never archived as Android;
 #   * boot_a is written whole (image plus zero fill), synced, flushed from the
 #     page cache, read back and compared; a mismatch rewrites the other set
-#     and exits non-zero without rebooting;
+#     -- or, when boot_a held anything else, the exact copy of it taken
+#     before the write -- and exits non-zero without rebooting;
 #   * hangup, interrupt and terminate are ignored while boot_a is being
 #     written, verified or restored (children inherit that), so no signal can
 #     leave it half-written; SIGKILL and power loss still can, which is what
@@ -495,6 +496,19 @@ install_set() { # <set> <way-back set>
 		say "dry-run: would write store/$1/boot.img ($is_size bytes, zero-filled to $BOOT_BYTES) to $BOOT_DEV"
 		return 0
 	fi
+	# When boot_a holds something other than the way-back set -- another
+	# Ubuntu build, say -- a failed write must put back exactly that, not the
+	# other system.  The copy lives in the store, which only Ubuntu writes.
+	is_live_copy=
+	if ! live_is_set "$2" && [ "$STORE_RO" = 0 ]; then
+		is_live_copy=$STORE/.live-$BOOT_LABEL.img
+		rm -f "$is_live_copy"
+		dd if="$BOOT_DEV" of="$is_live_copy" bs=1048576 count=$((BOOT_BYTES / 1048576)) 2>/dev/null ||
+			die "reading $BOOT_DEV failed; nothing was written"
+		[ "$(sha_of_file "$is_live_copy")" = "$LIVE_FULL" ] ||
+			die "$BOOT_LABEL changed while it was being copied; nothing was written"
+		say "saved the current $BOOT_LABEL to $is_live_copy for a rollback"
+	fi
 	say "writing $BOOT_LABEL <- store/$1/boot.img ($is_size bytes, zero-filled to $BOOT_BYTES)"
 	critical_begin
 	is_wrote=1
@@ -505,13 +519,18 @@ install_set() { # <set> <way-back set>
 	is_got=$(sha_of_part "$BOOT_DEV" "$BOOT_BYTES")
 	if [ "$is_wrote" = 1 ] && [ "$is_got" = "$is_want" ]; then
 		say "verified $BOOT_LABEL = $is_got"
+		[ -z "$is_live_copy" ] || rm -f "$is_live_copy"
 		LIVE_FULL=$is_got
 		LIVE_CLASS=$1
 		critical_end
 		return 0
 	fi
 	[ "$is_wrote" = 0 ] || warn "$BOOT_LABEL reads back as $is_got, expected $is_want"
-	rollback "$2"
+	if [ -n "$is_live_copy" ]; then
+		rollback_copy "$is_live_copy"
+	else
+		rollback "$2"
+	fi
 	die "$BOOT_LABEL could not be written with the $1 image; the tablet was NOT rebooted"
 }
 
@@ -533,6 +552,22 @@ rollback() { # <set to restore>
 	fi
 	warn "restoring the $1 image did not verify either; do not reboot:"
 	warn "flash $BOOT_LABEL from a host with fastboot first."
+	return 1
+}
+
+rollback_copy() { # <whole-partition copy taken before the write>
+	warn "restoring the previous contents of $BOOT_LABEL from $1"
+	rc_wrote=1
+	open_rw
+	write_image "$1" || rc_wrote=0
+	close_rw || :
+	if [ "$rc_wrote" = 1 ] && [ "$(sha_of_part "$BOOT_DEV" "$BOOT_BYTES")" = "$LIVE_FULL" ]; then
+		rm -f "$1"
+		warn "$BOOT_LABEL holds its previous contents again (verified); not rebooting"
+		return 0
+	fi
+	warn "restoring the previous contents did not verify either; do not reboot:"
+	warn "flash $BOOT_LABEL from a host with fastboot first (the copy is kept at $1)."
 	return 1
 }
 
@@ -670,6 +705,9 @@ cmd_status() {
 			say "$(printf 'store/%-8s' "$st_set")  absent"
 		fi
 	done
+	if [ -f "$STORE/ubuntu.prev/SHA256SUMS" ]; then
+		say "store/ubuntu.prev  $(sums_lookup "$STORE/ubuntu.prev")"
+	fi
 	[ ! -f "$STORE/state.json" ] || cat "$STORE/state.json"
 	return 0
 }
@@ -725,6 +763,43 @@ cmd_import_android() { # <image>
 	write_meta "$ia_tmp" android "import"
 	commit_set "$ia_tmp" android
 	say "imported $ia_src into store/android ($ia_sha)"
+}
+
+cmd_import_ubuntu() { # <image>
+	iu_src=$1
+	[ -f "$iu_src" ] || die "no such file: $iu_src"
+	[ "$(classify "$iu_src")" = ubuntu ] ||
+		die "$iu_src does not identify as this project's Ubuntu boot image (header v2 with a DTB)"
+	iu_size=$(stat -c %s "$iu_src")
+	[ "$iu_size" -le "$BOOT_BYTES" ] ||
+		die "$iu_src is $iu_size bytes, larger than $BOOT_LABEL ($BOOT_BYTES)"
+	if [ "$DRY_RUN" = 1 ]; then
+		say "dry-run: would import $iu_src into store/ubuntu, keeping the current set as store/ubuntu.prev"
+		return 0
+	fi
+	require_writable_store
+	iu_tmp=$STORE/.ubuntu.new
+	rm -rf "$iu_tmp"
+	mkdir -p "$iu_tmp" || die "cannot create $iu_tmp"
+	cp "$iu_src" "$iu_tmp/boot.img" || die "cannot copy $iu_src"
+	iu_sha=$(sha_of_file "$iu_tmp/boot.img")
+	[ "$iu_sha" = "$(sha_of_file "$iu_src")" ] || die "$iu_src changed while it was being copied"
+	printf '%s  boot.img\n' "$iu_sha" >"$iu_tmp/SHA256SUMS"
+	write_meta "$iu_tmp" ubuntu "import"
+	# The set it replaces stays as store/ubuntu.prev: a way back to the build
+	# that is known to boot, should the new one not.
+	critical_begin
+	sync
+	if [ -d "$STORE/ubuntu" ]; then
+		rm -rf "$STORE/ubuntu.prev"
+		mv "$STORE/ubuntu" "$STORE/ubuntu.prev" || die 'cannot move store/ubuntu aside'
+	fi
+	mv "$iu_tmp" "$STORE/ubuntu" || die "cannot move $iu_tmp into place"
+	sync
+	critical_end
+	say "imported $iu_src into store/ubuntu ($iu_sha)"
+	[ ! -d "$STORE/ubuntu.prev" ] || say 'the previous Ubuntu image is kept in store/ubuntu.prev'
+	say "run 'liuqin-switch to-ubuntu' to write it into $BOOT_LABEL"
 }
 
 cmd_to_ubuntu() {
@@ -804,6 +879,8 @@ Subcommands:
   verify                re-hash the store and boot_a; non-zero if anything is off
   stash-android         archive the live boot_a into store/android (Android only)
   import-android IMG    put an Android boot image file into store/android
+  import-ubuntu IMG     put a new Ubuntu boot image into store/ubuntu; the
+                        current one is kept as store/ubuntu.prev
   to-ubuntu             archive Android if needed, write the Ubuntu image, reboot
   to-android            write the archived Android image, reboot
 
@@ -829,7 +906,7 @@ while [ $# -gt 0 ]; do
 		[ -z "$command" ] || usage 1
 		command=$1
 		;;
-	import-android)
+	import-android|import-ubuntu)
 		[ -z "$command" ] || usage 1
 		command=$1
 		shift
@@ -923,6 +1000,7 @@ status) cmd_status ;;
 verify) cmd_verify ;;
 stash-android) cmd_stash ;;
 import-android) cmd_import_android "$import_source" ;;
+import-ubuntu) cmd_import_ubuntu "$import_source" ;;
 to-ubuntu) cmd_to_ubuntu ;;
 to-android) cmd_to_android ;;
 esac

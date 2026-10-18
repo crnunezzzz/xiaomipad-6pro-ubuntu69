@@ -78,7 +78,10 @@ requires repeating that validation.
 `NON-HLOS.bin` restores `modem_a`, which contains the WLAN and DSP firmware;
 `BTFM.bin` restores `bluetooth_a`, and `dspso.bin` restores `dsp_a`. A missing or damaged firmware filesystem can
 crash Android before ADB starts even when its boot and system images match.
-Matching partitions are left alone. Before replacing one of these firmware partitions,
+Matching partitions are left alone. Every partition that does receive a stock
+image, apart from `super`, is first saved to the backup directory and verified:
+`vendor_boot_a`, `dtbo_a`, `vbmeta_a` and `vbmeta_system_a` as well as the
+firmware partitions below. Before replacing one of these firmware partitions,
 the installer saves its entire original contents as `modem_a.img`,
 `bluetooth_a.img` or `dsp_a.img` in the private backup directory and verifies its checksum.
 The replacement is zero-filled to the actual partition size and checked again
@@ -187,7 +190,11 @@ adding `--layout` prints the planned layout without accessing a device.
 Locally built or CI-generated bundles that have not passed device testing require
 `--allow-unverified` for an explicitly attended test.
 
-The installer boots `installer.img` in RAM, waits for its USB network, backs up
+The installer boots `installer.img` in RAM, waits for its USB network and,
+before anything is written, checks the battery charge, the RAM needed to stage
+the root archive and this tablet's factory data in `persist` (mounted
+read-only), the same conditions the root installation would otherwise refuse
+only after the partition table has changed. It then backs up
 boot_a, boot_b, persist and both copies of the partition table, verifies those
 backups, then edits the partition table, installs the rootfs and provisions this
 tablet's calibration and addresses. It formats `linux_root` and `linux_home` as
@@ -274,6 +281,14 @@ sudo liuqin-switch verify          # re-check both images; non-zero if anything 
 sudo liuqin-switch to-android      # write the Android image into boot_a and reboot
 ```
 
+A new Ubuntu boot image, for instance a kernel update, is installed without
+reinstalling the system:
+
+```sh
+sudo liuqin-switch import-ubuntu /path/to/boot.img   # the old set is kept as store/ubuntu.prev
+sudo liuqin-switch to-ubuntu --no-reboot
+```
+
 **From Android**, use the **Reboot to Ubuntu** button in the WebUI of the
 `liuqin_boot_ubuntu` KernelSU module, or run
 `su -c 'sh /data/adb/modules/liuqin_boot_ubuntu/system/bin/boot-ubuntu'`.
@@ -296,8 +311,10 @@ The switcher enforces these rules, in this order:
 - An image that identifies as the project's own is never archived as Android.
 - `boot_a` is written as a whole partition — the image followed by zeros —
   synced, read back and compared. If the read-back differs, or the write fails,
-  the previous system's image is written back and the switcher exits with an
-  error without restarting the tablet.
+  the previous contents are written back and the switcher exits with an
+  error without restarting the tablet. When `boot_a` held something other
+  than the stored way back -- another Ubuntu build, for instance -- the whole
+  partition is copied into the store first and that exact copy is restored.
 - The kernel read-only flag of `boot_a` and of its disk, which the storage
   guard sets on every boot, is cleared only for the write and restored on every
   exit path. Interrupt, hangup and terminate signals are ignored while `boot_a`

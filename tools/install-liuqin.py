@@ -45,6 +45,17 @@ ANDROID_FIRMWARE_PARTITIONS = ('modem_a', 'bluetooth_a', 'dsp_a')
 # every state of this installation: persist is never created, moved or removed.
 ANCHOR = 'persist'
 ZERO_DIGEST = hashlib.sha256(b'').hexdigest()
+# The way back from Android and the OTA freeze both live in the KernelSU
+# module, which needs a KernelSU-patched Android boot image.
+DUAL_WITHOUT_ROOT_WARNING = (
+    'WARNING: no --android-boot image was given, so Android will run the stock boot.img'
+    ' without KernelSU. From that Android there is no "Reboot to Ubuntu" (returning needs'
+    ' a computer with fastboot) and nothing stops an over-the-air update, which rewrites'
+    ' slot B, destroys the fallback copy of Ubuntu and makes the tablet start from a slot'
+    ' Android cannot run from. Prepare a KernelSU image with tools/patch-android-boot-ksu.py'
+    ' and pass it with --android-boot, or turn off automatic updates in Android first.\n'
+    '警告：未提供 --android-boot，Android 将使用不含 KernelSU 的原厂 boot.img：无法从 Android'
+    ' 直接返回 Ubuntu（需电脑 fastboot），也无法阻止 OTA 更新覆盖 B 槽。')
 
 
 def load_layout():
@@ -427,6 +438,8 @@ def main(argv=None):
             if args.android_boot is not None:
                 print('Android boot image override: ' + str(args.android_boot.resolve()))
                 print('  sha256 ' + rom_images['boot.img']['sha256'])
+            else:
+                print(DUAL_WITHOUT_ROOT_WARNING, file=sys.stderr, flush=True)
     else:
         restore = restore.resolve()
         if not (restore / 'gpt/manifest.json').is_file():
@@ -563,10 +576,15 @@ def main(argv=None):
         if release != manifest['kernel_release']:
             raise RuntimeError('Installer kernel does not match this bundle'
                                ' —— 安装器内核与包不匹配，请使用同一发布包内的全部文件')
-        # install-root.sh checks the charge again, but only after the
-        # partition table has been rewritten; a low battery must stop the
-        # installation while nothing on the tablet has changed.
-        check_battery(remote(BATTERY_PROBE).decode())
+        # install-root.sh refuses a low battery, a root archive that does not
+        # fit in RAM and incomplete factory data, but only after the partition
+        # table has been rewritten.  The same checks run here, while nothing on
+        # the tablet has changed.
+        archive_bytes = 0 if restore is not None else (bundle / 'rootfs.tar.gz').stat().st_size
+        preflight = device_layout('preflight', str(archive_bytes))
+        if 'liuqin-layout: PREFLIGHT_OK' not in preflight:
+            raise RuntimeError('the tablet did not pass the pre-installation checks; nothing was written')
+        print(preflight.strip(), flush=True)
         if restore is not None:
             restore_partition_table(remote, device_layout, restore, args.serial)
             remote("(sleep 2; /usr/sbin/liuqin-reboot bootloader) >/dev/null 2>&1 &")
@@ -622,22 +640,8 @@ def main(argv=None):
         if args.layout == 'dual':
             flashes = stock_images_to_flash(device_layout, {
                 name: entry for name, entry in rom_images.items() if name != ANDROID_BOOT_IMAGE})
-            for index, (image_name, entry) in enumerate(flashes):
-                name = entry['partition']
-                if name in ANDROID_FIRMWARE_PARTITIONS:
-                    if args.no_backup:
-                        firmware_bytes = int(remote('/bin/busybox blockdev --getsize64 ' +
-                                                    shlex.quote('/dev/disk/by-partlabel/' + name)).decode().strip())
-                    else:
-                        backups[name + '.img'] = backup_partition(remote, args.backup, name)
-                        firmware_bytes = (args.backup / (name + '.img')).stat().st_size
-                    firmware_scratch = Path(scratch.name) / name
-                    firmware_scratch.mkdir()
-                    image, digest = pad_boot_image(entry['path'], entry['sha256'],
-                                                   firmware_bytes, firmware_scratch)
-                    flashes[index] = (image_name, dict(entry, path=image,
-                                                      flash_bytes=firmware_bytes,
-                                                      flash_sha256=digest))
+            flashes = prepare_stock_flashes(remote, flashes, None if args.no_backup else args.backup,
+                                            backups, Path(scratch.name))
             if not args.no_backup:
                 (args.backup / 'SHA256SUMS').write_text(''.join(f'{h}  {n}\n' for n, h in backups.items()))
         base = f'http://{args.host_address}:{server.server_port}'
@@ -663,23 +667,6 @@ def main(argv=None):
             server.server_close()
         if scratch:
             scratch.cleanup()
-
-
-# The same minimum and the same power-supply walk as install-root.sh.
-MIN_BATTERY_PERCENT = 30
-BATTERY_PROBE = ('for s in /sys/class/power_supply/*; do'
-                 ' [ "$(cat "$s/type" 2>/dev/null)" = Battery ] || continue;'
-                 ' cat "$s/capacity"; break; done')
-
-
-def check_battery(report):
-    level = report.strip()
-    if not level.isdigit():
-        raise RuntimeError('battery level is unavailable; nothing was written')
-    if int(level) < MIN_BATTERY_PERCENT:
-        raise RuntimeError(f'battery is at {level}%; charge the tablet to at least'
-                           f' {MIN_BATTERY_PERCENT}% before installation. Nothing was written'
-                           ' —— 电量不足，未写入任何内容')
 
 
 def boot_slots(mode):
@@ -893,6 +880,43 @@ def apply_layout(device_layout, before, plan, saved, mode):
         raise RuntimeError(str(error) + ' —— 分区表写入失败，请用 --restore-partition-table '
                            + str(saved.parent) + ' 恢复出厂分区表后重试')
     print('New partition table verified.')
+
+
+# Stock images whose current contents are not saved before they are replaced:
+# super is a 7 GiB dynamic-partition container, rebuilt from the ROM's sparse
+# image, and not something the RAM channel can carry in reasonable time.
+UNSAVED_STOCK_PARTITIONS = ('super',)
+
+
+def prepare_stock_flashes(remote, flashes, backup_dir, backups, scratch):
+    """Save what each stock flash will replace, and pad the firmware images.
+
+    With a backup directory, every partition about to receive a stock image
+    is saved and verified first -- the firmware filesystems, and also
+    vendor_boot_a, dtbo_a and the vbmeta pair, so that Android's boot chain as
+    it was can be put back with fastboot -- apart from the partitions in
+    UNSAVED_STOCK_PARTITIONS.  Firmware images are zero-filled to the real
+    partition size, so no old tail survives a repair.  Returns the flashes,
+    with the firmware entries pointing at their padded copies.
+    """
+    prepared = []
+    for image_name, entry in flashes:
+        name = entry['partition']
+        if backup_dir is not None and name not in UNSAVED_STOCK_PARTITIONS:
+            backups[name + '.img'] = backup_partition(remote, backup_dir, name)
+        if name in ANDROID_FIRMWARE_PARTITIONS:
+            if backup_dir is None:
+                firmware_bytes = int(remote('/bin/busybox blockdev --getsize64 ' +
+                                            shlex.quote('/dev/disk/by-partlabel/' + name)).decode().strip())
+            else:
+                firmware_bytes = (backup_dir / (name + '.img')).stat().st_size
+            firmware_scratch = scratch / name
+            firmware_scratch.mkdir()
+            image, digest = pad_boot_image(entry['path'], entry['sha256'],
+                                           firmware_bytes, firmware_scratch)
+            entry = dict(entry, path=image, flash_bytes=firmware_bytes, flash_sha256=digest)
+        prepared.append((image_name, entry))
+    return prepared
 
 
 def stock_images_to_flash(device_layout, images):
