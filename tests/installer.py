@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -63,7 +64,7 @@ with tempfile.TemporaryDirectory() as directory:
                                    )['images']['boot.img']['bytes']
 
     def run_install(argv_extra, reported, stdin_tty=False, answer=None, boot_size=hex(pinned_boot_bytes),
-                    max_download='0x30000000'):
+                    max_download='0x30000000', slot='a', anti=None, ram=None):
         calls = []
 
         def fastboot(command, **kwargs):
@@ -72,20 +73,23 @@ with tempfile.TemporaryDirectory() as directory:
             if command[3] == 'boot':
                 return SimpleNamespace(stdout='booting\n')
             name = command[-1]
-            values = {'product': 'liuqin', 'unlocked': 'yes', 'current-slot': 'a',
+            values = {'product': 'liuqin', 'unlocked': 'yes', 'current-slot': slot, 'anti': anti,
                       'partition-size:userdata': reported, 'partition-size:boot_a': boot_size,
                       'partition-size:boot_b': boot_size, 'max-download-size': max_download}
+            if values[name] is None:
+                # What fastboot does for a variable this bootloader lacks.
+                raise subprocess.CalledProcessError(1, command, 'getvar:' + name + ' FAILED')
             return SimpleNamespace(stdout=name + ': ' + values[name] + '\n')
 
         stdin = SimpleNamespace(isatty=lambda: stdin_tty)
         with patch.object(installer.sys, 'argv', ['install.py', '--bundle', str(root),
-                          '--serial', 'TEST_SERIAL', '--backup', str(root.parent / 'unused-backup'),
+                          '--serial', 'TEST_SERIAL', '--backup', str(root.parent / (root.name + '-unused-backup')),
                           '--erase-userdata', '--allow-unverified', '--layout', 'linux-only',
                           *argv_extra]), \
              patch.object(installer.subprocess, 'run', side_effect=fastboot), \
              patch.object(installer.sys, 'stdin', stdin), \
              patch('builtins.input', lambda *a: answer), \
-             patch.object(installer, 'command', side_effect=StopFlow('stop after boot')):
+             patch.object(installer, 'command', side_effect=ram or StopFlow('stop after boot')):
             try:
                 installer.main()
             except (SystemExit, RuntimeError, StopFlow):
@@ -134,6 +138,68 @@ with tempfile.TemporaryDirectory() as directory:
     calls = run_install(['--yes'], hex(16 * 1024**3), max_download=str(pinned_boot_bytes))
     assert calls[-1][3] == 'boot', calls
     print('PASS: boot partitions must be the pinned size and fit one fastboot download')
+
+    # A tablet left on slot B by an OTA still carries the previous release's
+    # bootloader chain in slot A; nothing is booted until slot A is active.
+    for slot in ('b', '_b', None):
+        calls = run_install(['--yes'], hex(16 * 1024**3), slot=slot)
+        assert not any(call[3:4] == ['boot'] for call in calls), (slot, calls)
+    calls = run_install(['--yes'], hex(16 * 1024**3), slot='_a')
+    assert calls[-1][3] == 'boot', calls
+    print('PASS: the RAM installer is booted only when slot A is the active slot')
+
+    pinned_anti = json.loads((project / 'tools/lib/liuqin-rom-images.json').read_text())['anti_version']
+    for anti, admitted in ((None, True), (str(pinned_anti), True), (str(pinned_anti + 1), False),
+                           ('garbage', False)):
+        messages = []
+        parser = SimpleNamespace(error=lambda text: (messages.append(text), (_ for _ in ()).throw(SystemExit(2))))
+        getvar = {'current-slot': 'a', 'anti': anti}.get
+        try:
+            installer.check_bootloader_state(parser, 'dual', getvar)
+        except SystemExit:
+            pass
+        assert (not messages) == admitted, (anti, messages)
+    installer.check_bootloader_state(SimpleNamespace(error=None), 'linux-only',
+                                     {'current-slot': 'a', 'anti': '99'}.get)
+    print('PASS: the dual layout refuses a tablet whose anti-rollback index is above the pinned ROM')
+
+    # The RAM installer's first act after identifying itself is the
+    # preflight; a refusal there ends the run before backups, wipes or the
+    # partition table are touched.
+    manifest = json.loads((root / 'bundle.json').read_text())
+    (root / 'bundle.json').write_text(json.dumps(dict(manifest, kernel_release='6.17.0-liuqin')))
+    boot_id = '0f0f0f0f-0000-4000-8000-000000000001'
+
+    def fake_ram(preflight_ok):
+        sent = []
+
+        def ram(address, text, timeout=60):
+            sent.append(text)
+            if 'cat /proc/sys/kernel/random/boot_id' in text and 'liuqin-installer' in text:
+                return boot_id.encode()
+            if text.endswith('cat /proc/cmdline'):
+                return b'androidboot.serialno=TEST_SERIAL androidboot.slot_suffix=_a'
+            if text.endswith('uname -r'):
+                return b'6.17.0-liuqin\n'
+            if 'install-layout.sh' in text and ' preflight ' in text:
+                if preflight_ok:
+                    return b'liuqin-layout: PREFLIGHT_OK battery=80\n'
+                raise RuntimeError('liuqin-layout: battery is at 12%')
+            raise StopFlow('stop after preflight: ' + text)
+        return ram, sent
+
+    ram, sent = fake_ram(False)
+    run_install(['--yes'], hex(16 * 1024**3), ram=ram)
+    assert 'preflight' in sent[-1] and str((root / 'rootfs.tar.gz').stat().st_size) in sent[-1], sent
+    ram, sent = fake_ram(True)
+    run_install(['--yes'], hex(16 * 1024**3), ram=ram)
+    assert 'preflight' in sent[-2] and 'stop' not in sent[-2], sent
+    assert not any(word in text for text in sent[:-1] for word in ('base64', 'wipe-head', 'apply')), sent
+    # This run got as far as creating the private backup directory.
+    shutil.rmtree(root.parent / (root.name + '-unused-backup'), ignore_errors=True)
+    (root / 'bundle.json').write_text(json.dumps(manifest))
+    print('PASS: the RAM preflight runs before any backup or write, and a refusal stops the run')
+
 
 # A local fake shell supplies a CRLF transcript containing the echoed command.
 # Only complete marker lines may finish the transaction, not the echo itself.
@@ -184,7 +250,7 @@ with tempfile.TemporaryDirectory() as directory:
     (root / 'bundle.json').write_text(json.dumps({'device': 'liuqin', 'files': files,
                                                   'status': 'OFFLINE_ASSEMBLED'}))
     base = ['python3', str(project / 'tools/install-liuqin.py'), '--bundle', str(root),
-            '--serial', 'TEST_SERIAL', '--backup', str(root.parent / 'unused-backup'),
+            '--serial', 'TEST_SERIAL', '--backup', str(root.parent / (root.name + '-unused-backup')),
             '--erase-userdata', '--allow-unverified', '--yes']
     for extra, fragment in (
             ([], b'--layout'),
@@ -307,6 +373,46 @@ for name, partition in firmware_images.items():
         else:
             raise AssertionError('firmware backup hash mismatch was accepted')
 print('PASS: required Android firmware is repaired only on mismatch, with verified private backups')
+
+# Every stock flash but super saves what it replaces, so the boot chain that
+# was on the tablet can be flashed back; the firmware images are padded to
+# the size of the partition they replace.
+with tempfile.TemporaryDirectory() as directory:
+    base = Path(directory)
+    backup_dir = base / 'backup'
+    backup_dir.mkdir()
+    scratch = base / 'scratch'
+    scratch.mkdir()
+    contents = {name: ('old ' + name).encode() * 64 for name in
+                ('vendor_boot_a', 'dtbo_a', 'vbmeta_a', 'vbmeta_system_a', 'modem_a')}
+
+    def device(command, timeout=60):
+        name = command.split('/dev/disk/by-partlabel/')[1].split()[0]
+        assert name in contents, command
+        if 'base64' in command:
+            return base64.b64encode(contents[name])
+        return (hashlib.sha256(contents[name]).hexdigest() + '  x\n').encode()
+
+    flashes = []
+    for name, entry in sorted(pinned['images'].items()):
+        if name == 'boot.img':
+            continue
+        if entry['partition'] in ('bluetooth_a', 'dsp_a'):
+            continue
+        source = base / name
+        source.write_bytes(b'stock ' + name.encode())
+        flashes.append((name, dict(entry, path=source, sha256=installer.sha(source))))
+    backups = {}
+    prepared = installer.prepare_stock_flashes(device, flashes, backup_dir, backups, scratch)
+    assert sorted(backups) == sorted(n + '.img' for n in contents), backups
+    for name, data in contents.items():
+        assert (backup_dir / (name + '.img')).read_bytes() == data
+    assert not (backup_dir / 'super.img').exists()
+    modem = dict(prepared)['NON-HLOS.bin']
+    assert modem['flash_bytes'] == len(contents['modem_a']) and Path(modem['path']).parent == scratch / 'modem_a'
+    assert dict(prepared)['vbmeta.img']['path'] == base / 'vbmeta.img'
+    assert [n for n, _ in prepared] == [n for n, _ in flashes]
+print('PASS: every stock flash except super saves and verifies the partition it replaces')
 
 # The installer RAM image has no /tmp, so everything the host writes on the
 # tablet goes to the scratch directory the device script reads from -- and the

@@ -107,6 +107,10 @@ Android 的 OTA 会改写非活动槽并将其设为活动槽，而该槽保存�
 - Xiaomi Pad 6 Pro（liuqin），出厂分区表、4096 字节逻辑扇区，且 `userdata` 为最后一个分区；
   自定义分区布局会被拒绝。
 - Bootloader 已解锁，平板进入 Fastboot，电量至少 30%。
+- 当前激活槽位为 A（`fastboot getvar current-slot` 显示 `a`）。Android OTA 可能使平板停留在 B 槽，
+  此时 A 槽保存的是上一版本的引导链；安装器在 A 槽重新激活前拒绝开始，请用原厂 ROM 恢复，
+  不要使用 `fastboot --set-active`。`--layout dual` 还会拒绝防回滚版本（`fastboot getvar anti`）
+  高于本项目所验证 ROM 的平板。
 - Linux 主机、Python 3.11 或更新版本、Android platform-tools，以及正常的 USB 网络支持。
 - 个人文件已备份到平板以外；安装会清空整个 userdata，安装器不会备份个人文件。
 - 已准备适配本机、满足防回滚要求的原厂 Fastboot ROM，并明确如何恢复 Android。

@@ -51,6 +51,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y busybox-static e2fsprogs
           sh tests/install-root.sh
+      - name: Dual-boot switcher and slot handling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static
+          sh tests/install-switch-store.sh
+          sh tests/switch-selftest.sh
+          python3 tests/slot-tool.py
       - name: Sensor startup policy
         run: |
           sudo apt-get update
